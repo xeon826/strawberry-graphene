@@ -1,11 +1,15 @@
-# Based on https://github.com/jkimbo/strawberry-graphene/blob/main/strawberry_graphene/schema.py
+import datetime
 import inspect
 from decimal import Decimal
+from enum import Enum
+from functools import partial
+from graphene.utils.str_converters import to_snake_case
 from typing import Any, Dict, Optional, Sequence, Type, Union
 
 import graphene
 import strawberry
 from graphene.types.base import BaseType as BaseGrapheneType
+from graphene.types.definitions import GrapheneUnionType
 from graphene.types.schema import TypeMap as BaseGrapheneTypeMap
 from graphql import (
     ExecutionContext as GraphQLExecutionContext,
@@ -21,14 +25,27 @@ from strawberry.custom_scalar import ScalarDefinition, ScalarWrapper
 from strawberry.directive import StrawberryDirective
 from strawberry.enum import EnumDefinition
 from strawberry.extensions import Extension
+from strawberry.field import StrawberryField
 from strawberry.schema import schema_converter
 from strawberry.schema.config import StrawberryConfig
+from strawberry.schema.schema_converter import CustomGraphQLEnumType
 from strawberry.schema.types import ConcreteType
 from strawberry.schema.types.scalar import DEFAULT_SCALAR_REGISTRY
 from strawberry.types.types import TypeDefinition
 from strawberry.union import StrawberryUnion
+from strawberry.utils.str_converters import to_camel_case
 
-from strawberry_graphene.extension import SyncToAsync
+
+def to_enum_name(s: str) -> str:
+    return to_snake_case(s.replace('.', '_').replace('-', '_')).upper()
+
+
+class OurCustomGraphQLEnumType(CustomGraphQLEnumType):
+    def serialize(self, output_value: Any) -> str:
+        if isinstance(output_value, Enum):
+            return to_enum_name(output_value.value)
+        return super().serialize(output_value)
+
 
 class GraphQLCoreConverter(schema_converter.GraphQLCoreConverter):
     def __init__(self, *args, **kwargs):
@@ -46,9 +63,37 @@ class GraphQLCoreConverter(schema_converter.GraphQLCoreConverter):
         return self.from_object(object_type._type_definition)
 
     def from_type(self, type_: Any) -> GraphQLType:
-        if issubclass(type_, BaseGrapheneType):
+        if inspect.isclass(type_) and issubclass(type_, BaseGrapheneType):
             return self.add_graphene_type(type_)
         return super().from_type(type_)
+
+    def from_enum(self, enum: EnumDefinition) -> CustomGraphQLEnumType:
+        enum_name = self.config.name_converter.from_type(enum)
+
+        assert enum_name is not None
+
+        # Don't reevaluate known types
+        if enum_name in self.type_map:
+            graphql_enum = self.type_map[enum_name].implementation
+            assert isinstance(
+                graphql_enum, OurCustomGraphQLEnumType
+            )  # For mypy
+            return graphql_enum
+
+        graphql_enum = OurCustomGraphQLEnumType(
+            name=enum_name,
+            values={
+                to_enum_name(item.value): self.from_enum_value(item)
+                for item in enum.values
+            },
+            description=enum.description,
+        )
+
+        self.type_map[enum_name] = ConcreteType(
+            definition=enum, implementation=graphql_enum
+        )
+
+        return graphql_enum
 
 
 class GrapheneTypeMap(BaseGrapheneTypeMap):
@@ -56,17 +101,54 @@ class GrapheneTypeMap(BaseGrapheneTypeMap):
         self.strawberry_convertor = strawberry_convertor
         super().__init__(*args, **kwargs)
 
+    def construct_union(self, graphene_type):
+        create_graphql_type = self.add_type
+
+        def types():
+            union_types = []
+            for graphene_objecttype in graphene_type._meta.types:
+                object_type = create_graphql_type(graphene_objecttype)
+                union_types.append(object_type)
+            return union_types
+
+        resolve_type = (
+            partial(
+                self.resolve_type,
+                graphene_type.resolve_type,
+                graphene_type._meta.name,
+            )
+            if graphene_type.resolve_type
+            else None
+        )
+
+        return GrapheneUnionType(
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
+            types=types,
+            resolve_type=resolve_type,
+        )
+
     def add_type(self, graphene_type):
         if hasattr(graphene_type, "_type_definition") or hasattr(
             graphene_type, "_enum_definition"
         ):
-            return self.strawberry_convertor.from_type(graphene_type)
+            try:
+                return self.strawberry_convertor.from_type(graphene_type)
+            except RecursionError as e:
+                raise RuntimeError(
+                    f'You probably have @strawberry.type decorator on a class that inherits from graphene. Please remove the graphene base class from {graphene_type}.'
+                ) from e
 
         # Special case decimal
         if isinstance(graphene_type, type) and issubclass(
             graphene_type, graphene.Decimal
         ):
             return self.strawberry_convertor.from_scalar(Decimal)
+        if isinstance(graphene_type, type) and issubclass(
+            graphene_type, graphene.DateTime
+        ):
+            return self.strawberry_convertor.from_scalar(datetime.datetime)
 
         if inspect.isfunction(graphene_type):
             graphene_type = graphene_type()
@@ -85,10 +167,34 @@ class GrapheneTypeMap(BaseGrapheneTypeMap):
             return graphql_type
         if issubclass(graphene_type, graphene.ObjectType):
             graphql_type = self.create_objecttype(graphene_type)
+
+            # Calling vars(graphene_type).items() on some graphene objects
+            # causes later infinite recursion.. Quick hack to get moving for
+            # now.
+            if hasattr(graphene_type, 'has_strawberry_field'):
+                # Create gql fields for all strawberry fields/mutations,
+                # because create_objecttype(graphene_type) creates only
+                # graphene fields.
+                # This attr must be set on all graphene classes that
+                # reference strawberry field or mutation.
+                for name, field in vars(graphene_type).items():
+                    if isinstance(field, StrawberryField):
+                        gql_field = self.strawberry_convertor.from_field(field)
+                        camel_case_name = to_camel_case(name)
+                        graphql_type.fields[camel_case_name] = gql_field
+
         elif issubclass(graphene_type, graphene.InputObjectType):
             graphql_type = self.create_inputobjecttype(graphene_type)
         elif issubclass(graphene_type, graphene.Interface):
-            graphql_type = self.create_interface(graphene_type)
+            # allows us to prefer the strawberry implementation of an interface
+            # (mostly useful for Node)
+            if graphene_type._meta.name in self.strawberry_convertor.type_map:
+                graphql_type = self.strawberry_convertor.type_map[
+                    graphene_type._meta.name
+                ].implementation
+                graphql_type.graphene_type = graphene_type
+            else:
+                graphql_type = self.create_interface(graphene_type)
         elif issubclass(graphene_type, graphene.Scalar):
             graphql_type = self.create_scalar(graphene_type)
         elif issubclass(graphene_type, graphene.Enum):
@@ -197,3 +303,4 @@ class Schema(strawberry.Schema):
             )
 
         return None
+
