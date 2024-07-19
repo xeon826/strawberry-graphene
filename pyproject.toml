@@ -12,10 +12,6 @@ Django = ">=3.2.9"
 
 [tool.poetry.dev-dependencies]
 pytest = "^6.2.4"
-black = "^21.5b1"
-flake8 = "^3.9.2"
-flake8-black = "^0.2.1"
-flake8-bugbear = "^21.4.3"
 pdbpp = "^0.10.2"
 
 [build-system]
