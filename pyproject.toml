@@ -6,7 +6,7 @@ authors = ["Jonathan Kim <jkimbo@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = "^3.7"
-strawberry-graphql ">=0.93.10"
+strawberry-graphql = ">=0.93.10"
 graphene = ">=3.0"
 Django = ">=3.2.9"
 
