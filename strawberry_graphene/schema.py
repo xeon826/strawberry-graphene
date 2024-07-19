@@ -272,7 +272,7 @@ class Schema(strawberry.Schema):
             query=query_type,
             mutation=mutation_type,
             subscription=subscription_type if subscription else None,
-            directives=specified_directives + graphql_directives,
+            directives=tuple(specified_directives) + tuple(graphql_directives),
             types=graphql_types,
         )
 
